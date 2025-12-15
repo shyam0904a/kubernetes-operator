@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -41,6 +42,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	netbirdiov1 "github.com/netbirdio/kubernetes-operator/api/v1"
+	"github.com/netbirdio/kubernetes-operator/internal/authproxy"
 	"github.com/netbirdio/kubernetes-operator/internal/controller"
 	webhookk8siov1 "github.com/netbirdio/kubernetes-operator/internal/webhook/v1"
 	webhooknetbirdiov1 "github.com/netbirdio/kubernetes-operator/internal/webhook/v1"
@@ -105,6 +107,24 @@ func main() {
 		"",
 		"Default labels used for all resources, in format key=value,key=value",
 	)
+
+	// Auth Proxy flags
+	var (
+		authProxyEnabled    bool
+		authProxyMode       string
+		authProxyListenAddr string
+		authProxyK8sAPI     string
+		authProxyTLSCert    string
+		authProxyTLSKey     string
+		nbDaemonAddr        string
+	)
+	flag.BoolVar(&authProxyEnabled, "auth-proxy-enabled", false, "Enable the K8s API auth proxy")
+	flag.StringVar(&authProxyMode, "auth-proxy-mode", "auth", "Auth proxy mode: 'auth' (impersonation) or 'noauth' (passthrough)")
+	flag.StringVar(&authProxyListenAddr, "auth-proxy-listen", ":6443", "Address for auth proxy to listen on")
+	flag.StringVar(&authProxyK8sAPI, "auth-proxy-k8s-api", "https://kubernetes.default.svc", "Kubernetes API server URL")
+	flag.StringVar(&authProxyTLSCert, "auth-proxy-tls-cert", "", "TLS certificate file for auth proxy")
+	flag.StringVar(&authProxyTLSKey, "auth-proxy-tls-key", "", "TLS key file for auth proxy")
+	flag.StringVar(&nbDaemonAddr, "netbird-daemon-addr", "unix:///var/run/netbird.sock", "NetBird daemon address")
 
 	// Controller generic flags
 	var (
@@ -319,6 +339,41 @@ func main() {
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
+	}
+
+	// Start auth proxy if enabled
+	if authProxyEnabled {
+		setupLog.Info("starting auth proxy",
+			"mode", authProxyMode,
+			"listen", authProxyListenAddr,
+			"k8s-api", authProxyK8sAPI,
+		)
+
+		peerStore := authproxy.NewPeerStore(nbDaemonAddr, 5*time.Second, setupLog)
+		if err := peerStore.Start(ctrl.SetupSignalHandler()); err != nil {
+			setupLog.Error(err, "unable to start peer store")
+			os.Exit(1)
+		}
+
+		proxyServer, err := authproxy.New(authproxy.Config{
+			ListenAddr:   authProxyListenAddr,
+			Mode:         authProxyMode,
+			K8sAPIServer: authProxyK8sAPI,
+			TLSCertFile:  authProxyTLSCert,
+			TLSKeyFile:   authProxyTLSKey,
+			Logger:       setupLog,
+			PeerLookup:   peerStore.LookupByIP,
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to create auth proxy")
+			os.Exit(1)
+		}
+
+		go func() {
+			if err := proxyServer.Start(ctrl.SetupSignalHandler()); err != nil {
+				setupLog.Error(err, "auth proxy failed")
+			}
+		}()
 	}
 
 	setupLog.Info("starting manager")
