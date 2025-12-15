@@ -108,6 +108,24 @@ rules:
   - get
   - list
   - watch
+{{- if .Values.authProxy.enabled }}
+# Auth proxy impersonation permissions
+- apiGroups:
+  - ""
+  resources:
+  - users
+  - groups
+  - serviceaccounts
+  verbs:
+  - impersonate
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - userextras/scopes
+  - userextras/uid
+  verbs:
+  - impersonate
+{{- end }}
 {{- if or (or .Values.netbirdAPI.key .Values.netbirdAPI.keyFromSecret) .Values.clusterSecretsPermissions.allowAllSecrets }}
 - apiGroups:
   - ""

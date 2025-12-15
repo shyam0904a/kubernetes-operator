@@ -3,6 +3,21 @@ clusterSecretsPermissions:
   # Required for Ingress functionality to create and validate secrets for routing peers
   allowAllSecrets: true
 
+# Auth proxy configuration for K8s API access via NetBird
+authProxy:
+  # Enable the K8s API auth proxy
+  enabled: false
+  # Auth proxy mode: 'auth' (impersonation based on NetBird identity) or 'noauth' (passthrough)
+  mode: "auth"
+  # Listen address for the auth proxy
+  listenAddr: ":6443"
+  # TLS configuration (optional, if empty proxy runs HTTP)
+  tls:
+    certFile: ""
+    keyFile: ""
+  # NetBird daemon socket address
+  daemonAddr: "unix:///var/run/netbird.sock"
+
 webhook:
   service:
     type: ClusterIP

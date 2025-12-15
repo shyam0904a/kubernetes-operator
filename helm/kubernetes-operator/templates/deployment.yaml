@@ -73,10 +73,27 @@ spec:
           {{- end }}
           - --default-labels="{{ join ", " $list }}"
           {{- end }}
+          {{- if .Values.authProxy.enabled }}
+          - --auth-proxy-enabled
+          - --auth-proxy-mode={{ .Values.authProxy.mode }}
+          - --auth-proxy-listen={{ .Values.authProxy.listenAddr }}
+          {{- if .Values.authProxy.tls.certFile }}
+          - --auth-proxy-tls-cert={{ .Values.authProxy.tls.certFile }}
+          {{- end }}
+          {{- if .Values.authProxy.tls.keyFile }}
+          - --auth-proxy-tls-key={{ .Values.authProxy.tls.keyFile }}
+          {{- end }}
+          - --netbird-daemon-addr={{ .Values.authProxy.daemonAddr }}
+          {{- end }}
           ports:
             - name: webhook-server
               containerPort: {{ .Values.webhook.service.port }}
               protocol: TCP
+            {{- if .Values.authProxy.enabled }}
+            - name: auth-proxy
+              containerPort: 6443
+              protocol: TCP
+            {{- end }}
           livenessProbe:
             failureThreshold: 3
             httpGet:
