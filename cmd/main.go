@@ -341,6 +341,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Setup signal handler once - can only be called once per process
+	ctx := ctrl.SetupSignalHandler()
+
 	// Start auth proxy if enabled
 	if authProxyEnabled {
 		setupLog.Info("starting auth proxy",
@@ -350,7 +353,7 @@ func main() {
 		)
 
 		peerStore := authproxy.NewPeerStore(nbDaemonAddr, 5*time.Second, setupLog)
-		if err := peerStore.Start(ctrl.SetupSignalHandler()); err != nil {
+		if err := peerStore.Start(ctx); err != nil {
 			setupLog.Error(err, "unable to start peer store")
 			os.Exit(1)
 		}
@@ -370,14 +373,14 @@ func main() {
 		}
 
 		go func() {
-			if err := proxyServer.Start(ctrl.SetupSignalHandler()); err != nil {
+			if err := proxyServer.Start(ctx); err != nil {
 				setupLog.Error(err, "auth proxy failed")
 			}
 		}()
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

@@ -3,11 +3,13 @@ package authproxy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -66,14 +68,24 @@ func New(config Config) (*Server, error) {
 		logger: config.Logger.WithName("authproxy"),
 	}
 
+	// Load in-cluster CA cert if available
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true, // Fallback
+	}
+	if caData, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"); err == nil {
+		caCertPool := x509.NewCertPool()
+		if caCertPool.AppendCertsFromPEM(caData) {
+			tlsConfig = &tls.Config{
+				RootCAs: caCertPool,
+			}
+		}
+	}
+
 	// Create reverse proxy
 	s.proxy = &httputil.ReverseProxy{
 		Director: s.director(targetURL),
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				// Use the service account token for auth to API server
-				InsecureSkipVerify: true, // In production, load the CA cert
-			},
+			TLSClientConfig: tlsConfig,
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
@@ -90,40 +102,54 @@ func New(config Config) (*Server, error) {
 
 // director modifies the request before forwarding
 func (s *Server) director(target *url.URL) func(*http.Request) {
+	// Read ServiceAccount token once
+	saToken := ""
+	if tokenData, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token"); err == nil {
+		saToken = string(tokenData)
+	}
+
 	return func(req *http.Request) {
 		// Set target
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.Host = target.Host
 
-		// Remove any existing impersonation headers (security)
-		for key := range req.Header {
-			if strings.HasPrefix(strings.ToLower(key), "impersonate-") {
-				req.Header.Del(key)
-			}
-		}
-
-		// In auth mode, add impersonation headers based on peer identity
-		if s.config.Mode == ModeAuth && s.config.PeerLookup != nil {
-			clientIP := extractClientIP(req.RemoteAddr)
-			userId, groups, ok := s.config.PeerLookup(clientIP)
-			if ok {
-				s.logger.V(1).Info("impersonating user", "ip", clientIP, "user", userId, "groups", groups)
-				req.Header.Set("Impersonate-User", userId)
-				for _, group := range groups {
-					req.Header.Add("Impersonate-Group", group)
+		if s.config.Mode == ModeAuth {
+			// In auth mode: strip existing impersonation headers and add based on peer identity
+			for key := range req.Header {
+				if strings.HasPrefix(strings.ToLower(key), "impersonate-") {
+					req.Header.Del(key)
 				}
-			} else {
-				s.logger.Info("peer identity not found, denying request", "ip", clientIP)
-				// We'll handle this in the error handler by checking if impersonation headers are set
+			}
+
+			// Use ServiceAccount token to auth to K8s API, then impersonate the user
+			if saToken != "" {
+				req.Header.Set("Authorization", "Bearer "+saToken)
+			}
+
+			// Add impersonation headers based on peer identity
+			if s.config.PeerLookup != nil {
+				clientIP := extractClientIP(req.RemoteAddr)
+				userId, groups, ok := s.config.PeerLookup(clientIP)
+				if ok {
+					s.logger.V(1).Info("impersonating user", "ip", clientIP, "user", userId, "groups", groups)
+					req.Header.Set("Impersonate-User", userId)
+					for _, group := range groups {
+						req.Header.Add("Impersonate-Group", group)
+					}
+				} else {
+					s.logger.Info("peer identity not found, denying request", "ip", clientIP)
+				}
 			}
 		}
+		// In noauth mode: pass through all headers as-is (including Authorization and Impersonate-*)
 
 		// Log the request
 		s.logger.V(1).Info("proxying request",
 			"method", req.Method,
 			"path", req.URL.Path,
 			"remote", req.RemoteAddr,
+			"mode", s.config.Mode,
 		)
 	}
 }
@@ -195,4 +221,3 @@ func extractClientIP(remoteAddr string) string {
 	}
 	return host
 }
-

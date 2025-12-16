@@ -2,14 +2,14 @@ package authproxy
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"net"
-	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/netbirdio/netbird/client/proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // PeerStore maintains a cache of peer identity information from the NetBird daemon
@@ -20,7 +20,6 @@ type PeerStore struct {
 	mu          sync.RWMutex
 	peersByIP   map[string]*PeerInfo
 	stopCh      chan struct{}
-	httpClient  *http.Client
 }
 
 // PeerInfo contains identity information for a peer
@@ -31,40 +30,14 @@ type PeerInfo struct {
 	Groups []string
 }
 
-// peerStatusResponse matches the daemon status JSON response
-type peerStatusResponse struct {
-	Status     string `json:"status"`
-	FullStatus struct {
-		Peers []struct {
-			IP     string   `json:"IP"`
-			FQDN   string   `json:"fqdn"`
-			Groups []string `json:"groups"`
-			UserId string   `json:"userId"`
-		} `json:"peers"`
-	} `json:"fullStatus"`
-}
-
 // NewPeerStore creates a new peer store
 func NewPeerStore(daemonAddr string, refreshRate time.Duration, logger logr.Logger) *PeerStore {
-	transport := &http.Transport{}
-
-	// If it's a unix socket address, configure for Unix sockets
-	if len(daemonAddr) > 0 && daemonAddr[0] == '/' {
-		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return net.Dial("unix", daemonAddr)
-		}
-	}
-
 	return &PeerStore{
 		daemonAddr:  daemonAddr,
 		refreshRate: refreshRate,
 		logger:      logger.WithName("peerstore"),
 		peersByIP:   make(map[string]*PeerInfo),
 		stopCh:      make(chan struct{}),
-		httpClient: &http.Client{
-			Transport: transport,
-			Timeout:   10 * time.Second,
-		},
 	}
 }
 
@@ -117,47 +90,64 @@ func (ps *PeerStore) refreshLoop(ctx context.Context) {
 	}
 }
 
-// refresh fetches the latest peer status from the NetBird daemon
-// This uses a REST-like interface that the daemon may expose
+// dialDaemon connects to the NetBird daemon via gRPC
+func (ps *PeerStore) dialDaemon(ctx context.Context) (*grpc.ClientConn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	// Handle both unix socket and tcp addresses
+	// Format: unix:///var/run/netbird.sock or tcp://host:port
+	addr := strings.TrimPrefix(ps.daemonAddr, "tcp://")
+
+	return grpc.DialContext(
+		dialCtx,
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+}
+
+// refresh fetches the latest peer status from the NetBird daemon via gRPC
 func (ps *PeerStore) refresh(ctx context.Context) error {
-	// For now, we'll use a placeholder approach
-	// In production, this would call the netbird daemon's status API
-	// The actual implementation depends on how the daemon exposes peer info
-
-	// If using Unix socket HTTP
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost/api/status?fullPeerStatus=true", nil)
+	conn, err := ps.dialDaemon(ctx)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		ps.logger.V(1).Info("failed to connect to netbird daemon", "error", err)
+		return nil // Not a hard error - daemon might not be ready
 	}
+	defer conn.Close()
 
-	resp, err := ps.httpClient.Do(req)
+	client := proto.NewDaemonServiceClient(conn)
+
+	resp, err := client.Status(ctx, &proto.StatusRequest{
+		GetFullPeerStatus: true,
+	})
 	if err != nil {
-		// Not a hard error - daemon might not be ready
-		ps.logger.V(1).Info("failed to fetch peer status", "error", err)
+		ps.logger.V(1).Info("failed to get status from daemon", "error", err)
 		return nil
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var statusResp peerStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&statusResp); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+	fullStatus := resp.GetFullStatus()
+	if fullStatus == nil {
+		ps.logger.V(1).Info("daemon returned nil fullStatus")
+		return nil
 	}
 
 	newPeers := make(map[string]*PeerInfo)
-	for _, peer := range statusResp.FullStatus.Peers {
-		if peer.IP == "" {
+	for _, peer := range fullStatus.GetPeers() {
+		ip := peer.GetIP()
+		if ip == "" {
 			continue
 		}
-		newPeers[peer.IP] = &PeerInfo{
-			IP:     peer.IP,
-			FQDN:   peer.FQDN,
-			UserId: peer.UserId,
-			Groups: peer.Groups,
+		// Strip /32 suffix if present
+		ip = strings.TrimSuffix(ip, "/32")
+
+		newPeers[ip] = &PeerInfo{
+			IP:     ip,
+			FQDN:   peer.GetFqdn(),
+			UserId: peer.GetUserId(),
+			Groups: peer.GetGroups(),
 		}
+		ps.logger.V(2).Info("found peer", "ip", ip, "userId", peer.GetUserId(), "groups", peer.GetGroups())
 	}
 
 	ps.mu.Lock()
@@ -178,4 +168,11 @@ func (ps *PeerStore) AddPeer(ip, fqdn, userId string, groups []string) {
 		UserId: userId,
 		Groups: groups,
 	}
+}
+
+// GetPeerCount returns the number of peers in the cache
+func (ps *PeerStore) GetPeerCount() int {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return len(ps.peersByIP)
 }
